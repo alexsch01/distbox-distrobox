@@ -2134,6 +2134,45 @@ if [ "${init}" -eq 0 ]; then
 
 	# disable verbose logging for this phase.
 	set +x
+	while true; do
+		# Let's check for changes every 15 seconds.
+		# This way we can dynamically keep hosts, dns and timezone setups
+		# in sync with host, without having permissions problems:
+		#	- symlink will fail with "Device or Resource busy"
+		#	- bindmount will need a container restart on changes
+		for file_watch in ${HOST_WATCH}; do
+			# do stuff, only if the file is a mountpoint, and if the mountpoint is NOT containing the
+			# container id, because if it does, it is because it's part of the podman/docker setup
+			# The mount point might not exist, either because it's umounted or it doesn't exist on
+			# host in some cases like /etc/localtime, so ignore findmnt errors
+			mount_source="$(findmnt -no SOURCE "${file_watch}")" || :
+			if [ -n "${mount_source}" ] && ! echo "${mount_source}" | grep -q "${id}"; then
+				file_watch_src="/run/host${file_watch}"
+				# check if the target file exists
+				if ls -l "${file_watch_src}" 2> /dev/null > /dev/null; then
+					# if it's a symlink and take the source
+					if [ -L "${file_watch_src}" ]; then
+						file_watch_src="$(init_readlink "/run/host${file_watch}")"
+						# if it's an absolute link, we need to append /run/host ourselves.
+						if ! printf "%s" "${file_watch_src}" | grep -q "/run/host"; then
+							file_watch_src="/run/host${file_watch_src}"
+						fi
+					fi
+					if ! diff "${file_watch}" "${file_watch_src}" > /dev/null; then
+						# We only do this, if the file is actually different
+						umount "${file_watch}" &&
+							mount_bind "${file_watch_src}" "${file_watch}"
+
+						# Let's keep in sync host's hostname and container's hostname
+						if [ "${file_watch}" = "/etc/hostname" ]; then
+							hostname "$(cat /etc/hostname)"
+						fi
+					fi
+				fi
+			fi
+		done
+		sleep 15
+	done
 fi
 ###############################################################################
 
