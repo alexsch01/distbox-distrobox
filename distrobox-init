@@ -676,6 +676,7 @@ if [ "${upgrade}" -ne 0 ] ||
 			dnf-plugins-core
 			findutils
 			glibc-all-langpacks
+            glibc-common
 			glibc-locale-source
 			gnupg2
 			gnupg2-smime
@@ -707,6 +708,7 @@ if [ "${upgrade}" -ne 0 ] ||
 			tzdata
 			unzip
 			util-linux
+            util-linux-script
 			vte-profile
 			wget
 			which
