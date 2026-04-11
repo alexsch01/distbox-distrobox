@@ -37,6 +37,11 @@
 #	DBX_SKIP_WORKDIR
 #	DBX_SUDO_PROGRAM
 
+# Ensure we have our env variables correctly set
+[ -z "${USER}" ] && USER="$(id -run)"
+[ -z "${HOME}" ] && HOME="$(getent passwd "${USER}" | cut -d':' -f6)"
+[ -z "${SHELL}" ] && SHELL="$(getent passwd "${USER}" | cut -d':' -f7)"
+
 app_cache_dir=${XDG_CACHE_HOME:-"${HOME}/.cache"}/distrobox
 
 trap cleanup TERM INT HUP EXIT
@@ -81,11 +86,10 @@ if {
 fi
 
 # Defaults
-container_command=""
 # by default we use getent to get the login shell of the user and use that
+container_custom_command=0
 container_command_user="$(echo "${USER}" | sed 's|\\|\\\\|g')"
-container_command_login="/bin/sh -c \"\\\$(getent passwd ${container_command_user} | cut -f 7 -d :) -l\""
-container_image_default="registry.fedoraproject.org/fedora-toolbox:39"
+container_image_default="registry.fedoraproject.org/fedora-toolbox:latest"
 container_manager="autodetect"
 container_manager_additional_flags=""
 container_name=""
@@ -105,7 +109,7 @@ headless=0
 skip_workdir=0
 verbose=0
 clean_path=0
-version="1.7.2.1.1"
+version="1.8.2.4"
 
 # Source configuration files, this is done in an hierarchy so local files have
 # priority over system defaults
@@ -236,7 +240,12 @@ while :; do
 			;;
 		-a | --additional-flags)
 			if [ -n "$2" ]; then
-				container_manager_additional_flags="${container_manager_additional_flags} ${2}"
+				if [ -z "${container_manager_additional_flags=}" ]; then
+					container_manager_additional_flags="$(echo "${2}" | sed -E "s/(--[a-zA-Z]+) ([^ ]+)/\1=\2/g" | sed 's/ --/\n--/g')"
+				else
+					container_manager_additional_flags="${container_manager_additional_flags}
+					$(echo "${2}" | sed -E "s/(--[a-zA-Z]+) ([^ ]+)/\1=\2/g" | sed 's/ --/\n--/g')"
+				fi
 				shift
 				shift
 			fi
@@ -246,14 +255,9 @@ while :; do
 			shift
 			;;
 		-e | --exec | --)
+			container_custom_command=1
 			shift
-			container_command="\"$1\""
-			shift
-			for arg in "$@"; do
-				arg="$(echo "${arg}x" | sed 's|'\''|'\'\\\\\'\''|g')"
-				arg="${arg%x}"
-				container_command="${container_command} '${arg}'"
-			done
+			# We pass the rest of arguments as $@ at the end
 			break
 			;;
 		--clean-path)
@@ -353,7 +357,6 @@ fi
 #   container_manager: string container manager to use
 #   container_name: string container name
 #   container_manager_additional_flags: string container manager additional flags to use
-#   container_command: string container command to execute
 #   container_home: string container's home path
 #   container_path: string container's default PATH variable
 #   headless: bool headless mode
@@ -371,34 +374,21 @@ fi
 #   prints the podman, docker or lilipod command to enter the distrobox container
 generate_enter_command()
 {
-	result_command="${container_manager} exec"
+	result_command="exec"
 	result_command="${result_command}
 		--interactive"
 	result_command="${result_command}
-		--detach-keys=\"\""
+		--detach-keys="
 
 	# In case of initful systems or unshared groups, we don't enter directly
 	# as our user, but we instead enter as root, and then su $USER, in order
 	# to trigger a proper login
 	if [ "${unshare_groups:-0}" -eq 1 ]; then
 		result_command="${result_command}
-			--user='root'"
-
-		# We use `su` to become the designed user, this triggers a proper login
-		# and we instantiate a proper pty with it
-		container_command_login="su ${USER}"
-		if [ "${headless}" -eq 0 ]; then
-			container_command_login="${container_command_login} --pty"
-		fi
-
-		if [ -n "${container_command}" ]; then
-			# escape $ in order to avoid evaluation by the login shell
-			container_command="$(echo "${container_command}" | sed 's/\$/\\\$/g')"
-			container_command="${container_command_login} -c \"${container_command}\""
-		fi
+			--user=root"
 	else
 		result_command="${result_command}
-			--user=\"${USER}\""
+			--user=${USER}"
 	fi
 
 	# For some usage, like use in service, or launched by non-terminal
@@ -421,7 +411,7 @@ generate_enter_command()
 	# to avoid confusing the user about shifted paths.
 	# pass distrobox-enter path, it will be used in the distrobox-export tool.
 	if [ "${skip_workdir}" -eq 0 ]; then
-		workdir="$(echo "${PWD:-${container_home:-"/"}}" | sed -e 's/"/\\\"/g')"
+		workdir="${PWD:-${container_home:-"/"}}"
 		if [ -n "${workdir##*"${container_home}"*}" ]; then
 			workdir="/run/host${workdir}"
 		fi
@@ -429,26 +419,28 @@ generate_enter_command()
 		# Skipping workdir we just enter $HOME of the container.
 		workdir="${container_home}"
 	fi
+
 	result_command="${result_command}
-		--workdir=\"${workdir}\""
+		--workdir=${workdir}"
 	result_command="${result_command}
-		--env \"CONTAINER_ID=${container_name}\""
+		--env=PWD=${workdir}"
 	result_command="${result_command}
-		--env \"DISTROBOX_ENTER_PATH=${distrobox_enter_path}\""
+		--env=CONTAINER_ID=${container_name}"
+	result_command="${result_command}
+		--env=DISTROBOX_ENTER_PATH=${distrobox_enter_path}"
 
 	# Loop through all the environment vars
 	# and export them to the container.
 	set +o xtrace
 	# disable logging for this snippet, or it will be too talkative.
-	for i in $(printenv | grep '=' | grep -Ev ' |"|`|\$' |
-		grep -Ev '^(CONTAINER_ID|HOST|HOSTNAME|HOME|PATH|PROFILEREAD|SHELL|XDG_SEAT|XDG_VTNR|XDG_.*_DIRS|^_)'); do
-		# We filter the environment so that we do not have strange variables,
-		# multiline or containing spaces.
-		# We also NEED to ignore the HOME variable, as this is set at create time
-		# and needs to stay that way to use custom home dirs.
-		result_command="${result_command}
-			--env \"${i}\""
-	done
+	# We filter the environment so that we do not have strange variables or
+	# multiline.
+	# We also NEED to ignore the HOME variable, as this is set at create time
+	# and needs to stay that way to use custom home dirs. or it will be too talkative.
+	result_command="${result_command}
+		$(printenv | grep '=' | grep -Ev '"|`|\$' |
+		grep -Ev '^(CONTAINER_ID|FPATH|HOST|HOSTNAME|HOME|PATH|PROFILEREAD|PWD|SHELL|XDG_SEAT|XDG_VTNR|XDG_.*_DIRS|^_)' |
+		sed 's/ /\ /g' | sed 's/^\(.*\)$/--env=\1/g')"
 
 	# Start with the $PATH set in the container's config
 	container_paths="${container_path:-""}"
@@ -482,10 +474,46 @@ generate_enter_command()
 		else
 			container_paths="${PATH}"
 		fi
+
+		# Ensure /usr/local/{s,}bin appears before /usr/{s,}bin in PATH.
+		# This follows FHS conventions: /usr/local should override /usr,
+		# and ensures distrobox wrappers in /usr/local/bin are found first.
+		reordered_paths=""
+		IFS_OLD="${IFS}"
+		IFS=":"
+		for p in ${container_paths}; do
+			case "${p}" in
+				/usr/local/bin | /usr/local/sbin)
+					# skip, will be re-inserted before their /usr counterpart
+					;;
+				/usr/bin)
+					# insert /usr/local/bin right before /usr/bin
+					reordered_paths="${reordered_paths:+${reordered_paths}:}/usr/local/bin:${p}"
+					;;
+				/usr/sbin)
+					# insert /usr/local/sbin right before /usr/sbin
+					reordered_paths="${reordered_paths:+${reordered_paths}:}/usr/local/sbin:${p}"
+					;;
+				*)
+					reordered_paths="${reordered_paths:+${reordered_paths}:}${p}"
+					;;
+			esac
+		done
+		IFS="${IFS_OLD}"
+
+		# If /usr/bin or /usr/sbin were not in PATH, the corresponding
+		# /usr/local paths were skipped above. Re-add them if missing.
+		for lp in /usr/local/bin /usr/local/sbin; do
+			pattern="(:|^)${lp}(:|$)"
+			if ! echo "${reordered_paths}" | grep -Eq "${pattern}"; then
+				reordered_paths="${lp}:${reordered_paths}"
+			fi
+		done
+		container_paths="${reordered_paths}"
 	fi
 
 	result_command="${result_command}
-		--env \"PATH=${container_paths}\""
+		--env=PATH=${container_paths}"
 
 	# Ensure the standard FHS program paths are in XDG_DATA_DIRS environment
 	standard_paths="/usr/local/share /usr/share"
@@ -500,16 +528,16 @@ generate_enter_command()
 		fi
 	done
 	result_command="${result_command}
-		--env \"XDG_DATA_DIRS=${container_paths}\""
+		--env=XDG_DATA_DIRS=${container_paths}"
 
 	# This correctly sets the XDG_* dirs to the container_home
 	# it will be $HOME if using regular home dirs
 	# if will be $container_home if using a custom home during create
 	result_command="${result_command}
-		--env \"XDG_CACHE_HOME=${container_home}/.cache\"
-		--env \"XDG_CONFIG_HOME=${container_home}/.config\"
-		--env \"XDG_DATA_HOME=${container_home}/.local/share\"
-		--env \"XDG_STATE_HOME=${container_home}/.local/state\""
+		--env=XDG_CACHE_HOME=${container_home}/.cache
+		--env=XDG_CONFIG_HOME=${container_home}/.config
+		--env=XDG_DATA_HOME=${container_home}/.local/share
+		--env=XDG_STATE_HOME=${container_home}/.local/state"
 
 	# Ensure the standard FHS program paths are in XDG_CONFIG_DIRS environment
 	standard_paths="/etc/xdg"
@@ -524,7 +552,7 @@ generate_enter_command()
 		fi
 	done
 	result_command="${result_command}
-		--env \"XDG_CONFIG_DIRS=${container_paths}\""
+		--env=XDG_CONFIG_DIRS=${container_paths}"
 
 	# re-enable logging if it was enabled previously.
 	if [ "${verbose}" -ne 0 ]; then
@@ -541,37 +569,76 @@ generate_enter_command()
 	result_command="${result_command}
 		${container_name}"
 
-	if [ -n "${container_command}" ]; then
-		result_command="${result_command} ${container_command}"
-	else
-		# if no command was specified, let's execute a command that will find
-		# and run the default shell for the user
-		result_command="${result_command}
-			${container_command_login}"
-	fi
-
 	# Return generated command.
-	printf "%s" "${result_command}"
+	# here we remove tabs as an artifact of using indentation in code to improve
+	# readability
+	printf "%s\n" "${result_command}" | tr -d '\t'
 }
 
 container_home="${HOME}"
 container_path="${PATH}"
 unshare_groups=0
+
+################################################################################
+# In this section we will manipulate the positional parameters
+# in order to generate our long docker/podman/lilipod command to execute.
+#
+# We use positional parameters in order to have the shell manage escaping and spaces
+# so we remove the problem of we having to handle them.
+#
+# 1 - handle absence of custom command, we will need to add a getent command to
+#     execute the right container's user's shell
+# 2 - in case of unshared groups (or initful) we need to trigger a proper login
+#     using `su`, so we will need to manipulate these arguments accorodingly
+# 3 - prepend our generated command
+#     to do this, we use `tac` so we reverse loop it and prepend each argument.
+# 4 - now that we're done, we can prepend our container_command
+#     we will need to use `rev` to reverse it as we reverse loop and prepend each
+#     argument
+################################################################################
+#
+# Setup default commands if none are specified
+# execute a getent command using the /bin/sh shell
+# to find out the default shell of the user, and
+# do a login shell with it (eg: /bin/bash -l)
+if [ "${container_custom_command}" -eq 0 ]; then
+	set - "$@" "/bin/sh" "-c" "\$(getent passwd '${container_command_user}' | cut -f 7 -d :) -l"
+fi
+
+# If we have a command and we're unsharing groups, we need to execute those
+# command using su $container_command_user
+# if we're in a tty, also allocate one
+if [ "${unshare_groups:-0}" -eq 1 ]; then
+	# shellcheck disable=SC2089,SC2016
+	set -- "-c" '"$0" "$@"' -- "$@"
+	set -- "-s" "/bin/sh" "$@"
+	if [ "${headless}" -eq 0 ]; then
+		set -- "--pty" "$@"
+	fi
+	set -- "-m" "$@"
+	set -- "${container_command_user}" "$@"
+	set -- "su" "$@"
+fi
+
+################################################################################
+# Execution section
+################################################################################
+
+# dry run mode, just generate the command and print it. No execution.
+if [ "${dryrun}" -ne 0 ]; then
+	cmd="$(generate_enter_command | sed 's/\t//g')"
+	printf "%s %s\n" "${cmd}" "$*"
+	exit 0
+fi
+
 # Now inspect the container we're working with.
 container_status="unknown"
 eval "$(${container_manager} inspect --type container --format \
 	'container_status={{.State.Status}};
 	unshare_groups={{ index .Config.Labels "distrobox.unshare_groups" }};
-	{{range .Config.Env}}{{if slice . 0 5 | eq "HOME="}}container_home={{slice . 5 | printf "%q"}};{{end}}{{end}}
-	{{range .Config.Env}}{{if slice . 0 5 | eq "PATH="}}container_path={{slice . 5 | printf "%q"}}{{end}}{{end}}' \
+	{{range .Config.Env}}{{if and (ge (len .) 5) (eq (slice . 0 5) "HOME=")}}container_home={{slice . 5 | printf "%q"}}{{end}}{{end}};
+	{{range .Config.Env}}{{if and (ge (len .) 5) (eq (slice . 0 5) "PATH=")}}container_path={{slice . 5 | printf "%q"}}{{end}}{{end}}' \
 	"${container_name}")"
-
-# dry run mode, just generate the command and print it. No execution.
-if [ "${dryrun}" -ne 0 ]; then
-	cmd="$(generate_enter_command | sed 's/\t//g')"
-	printf "%s\n" "${cmd}"
-	exit 0
-fi
 
 # Check if the container is even there
 if [ "${container_status}" = "unknown" ]; then
@@ -599,7 +666,7 @@ if [ "${container_status}" = "unknown" ]; then
 			printf >&2 "Creating the container %s\n" "${container_name}"
 
 			if [ "${dryrun}" -ne 1 ]; then
-				eval "${create_command}"
+				${create_command}
 			fi
 			;;
 		n | N | No | no | NO)
@@ -621,7 +688,7 @@ if [ "${container_status}" != "running" ]; then
 	#
 	# Here, we save the timestamp before launching the start command, so we can
 	# be sure we're working with this very same session of logs later.
-	log_timestamp="$(date -u +%FT%T)"
+	log_timestamp="$(date -u +%FT%T).000000000+00:00"
 	${container_manager} start "${container_name}" > /dev/null
 	#
 	# Check if the container is going in error status earlier than the
@@ -685,6 +752,21 @@ if [ "${container_status}" != "running" ]; then
 fi
 
 # Generate the exec command and run it
-cmd="$(generate_enter_command)"
-# shellcheck disable=SC2086
-eval ${cmd}
+cmd="$(generate_enter_command | awk '{a[i++]=$0} END {for (j=i-1; j>=0;) print a[j--]}')"
+# Reverse it so we can reverse loop and prepend the command's arguments
+# to our positional parameters
+IFS='
+'
+for arg in ${cmd}; do
+	set - "${arg}" "$@"
+done
+
+# Prepend the container manager command
+# reverse it first, so we can loop backward as we're prepending not appending
+IFS=' '
+for arg in $(echo "${container_manager}" | rev); do
+	arg="$(echo "${arg}" | rev)"
+	set - "${arg}" "$@"
+done
+
+exec "$@"
