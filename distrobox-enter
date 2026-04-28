@@ -635,3 +635,134 @@ if [ "${unshare_groups:-0}" -eq 1 ]; then
 	set -- "-m" "$@"
 	set -- "su" "$@"
 fi
+
+################################################################################
+# Execution section
+################################################################################
+
+# dry run mode, just generate the command and print it. No execution.
+if [ "${dryrun}" -ne 0 ]; then
+	cmd="$(generate_enter_command | sed 's/\t//g')"
+	printf "%s %s\n" "${cmd}" "$*"
+	exit 0
+fi
+
+# Now inspect the container we're working with.
+container_status="unknown"
+eval "$(${container_manager} inspect --type container --format \
+	'container_status={{.State.Status}};
+	unshare_groups={{ index .Config.Labels "distrobox.unshare_groups" }};
+	{{range .Config.Env}}{{if and (ge (len .) 5) (eq (slice . 0 5) "HOME=")}}container_home={{slice . 5 | printf "%q"}}{{end}}{{end}};
+	{{range .Config.Env}}{{if and (ge (len .) 5) (eq (slice . 0 5) "PATH=")}}container_path={{slice . 5 | printf "%q"}}{{end}}{{end}}' \
+	"${container_name}")"
+
+# Check if the container is even there
+if [ "${container_status}" = "unknown" ]; then
+	# If not, prompt to create it first
+	# If we're not-interactive, just don't ask questions
+	if [ "${non_interactive}" -eq 1 ]; then
+		response="yes"
+	else
+		printf >&2 "Create it now, out of image %s? [Y/n]: " "${container_image_default}"
+		read -r response
+		response="${response:-"Y"}"
+	fi
+
+	# Accept only y,Y,Yes,yes,n,N,No,no.
+	case "${response}" in
+		y | Y | Yes | yes | YES)
+			# Ok, let's create the container with just 'distrobox create $container_name
+			create_command="$(dirname "${0}")/distrobox-create"
+			if [ "${rootful}" -ne 0 ]; then
+				create_command="${create_command} --root"
+			fi
+
+			create_command="${create_command} --yes -i ${container_image_default} -n ${container_name}"
+
+			printf >&2 "Creating the container %s\n" "${container_name}"
+
+			if [ "${dryrun}" -ne 1 ]; then
+				${create_command}
+			fi
+			;;
+		n | N | No | no | NO)
+			printf >&2 "Ok. For creating it, run this command:\n"
+			printf >&2 "\tdistrobox create <name-of-container> --image <remote>/<docker>:<tag>\n"
+			exit 0
+			;;
+		*) # Default case: If no more options then break out of the loop.
+			printf >&2 "Invalid input.\n"
+			printf >&2 "The available choices are: y,Y,Yes,yes,YES or n,N,No,no,NO.\nExiting.\n"
+			exit 1
+			;;
+	esac
+fi
+
+# If the container is not already running, we need to start if first
+if [ "${container_status}" != "running" ]; then
+	# If container is not running, start it first
+	#
+	# Here, we save the timestamp before launching the start command, so we can
+	# be sure we're working with this very same session of logs later.
+	log_timestamp="$(date -u +%FT%T).000000000+00:00"
+	${container_manager} start "${container_name}" > /dev/null
+	#
+	# Check if the container is going in error status earlier than the
+	# entrypoint
+	if [ "$(${container_manager} inspect \
+		--type container \
+		--format "{{.State.Status}}" "${container_name}")" != "running" ]; then
+
+		printf >&2 "\033[31m Error: could not start entrypoint.\n\033[0m"
+		container_manager_log="$(${container_manager} logs "${container_name}")"
+		printf >&2 "%s\n" "${container_manager_log}"
+		exit 1
+	fi
+
+	printf >&2 "%-40s\t" "Starting container..."
+	mkdir -p "${app_cache_dir}"
+	rm -f "${app_cache_dir}/.${container_name}.fifo"
+	mkfifo "${app_cache_dir}/.${container_name}.fifo"
+	while true; do
+		# Exit early in case of crashed/stopped container during setup
+		if [ "$(${container_manager} inspect --type container --format '{{.State.Status}}' "${container_name}")" != "running" ]; then
+			printf >&2 "\nContainer Setup Failure!\n"
+			exit 1
+		fi
+		# save starting loop timestamp in temp variable, we'll use it
+		# after to let logs command minimize possible holes
+		${container_manager} logs --since "${log_timestamp}" -f "${container_name}" \
+			> "${app_cache_dir}/.${container_name}.fifo" 2>&1 &
+		logs_pid="$!"
+
+		# read logs from log_timestamp to now, line by line
+		while IFS= read -r line; do
+			case "${line}" in
+				"+"*)
+					# Ignoring logging commands
+					;;
+				"Error:"*)
+					printf >&2 "\033[31m %s\n\033[0m" "${line}"
+					exit 1
+					;;
+				"Warning:"*)
+					printf >&2 "\n\033[33m %s\033[0m" "${line}"
+					;;
+				"distrobox:"*)
+					current_line="$(echo "${line}" | cut -d' ' -f2-)"
+					# Save current line in the status, to avoid printing the same line multiple times
+					printf >&2 "\033[32m [ OK ]\n\033[0m%-40s\t" "${current_line}"
+					;;
+				"container_setup_done"*)
+					printf >&2 "\033[32m [ OK ]\n\033[0m"
+					kill "${logs_pid}" > /dev/null 2>&1
+					break 2
+					;;
+				*) ;;
+			esac
+		done < "${app_cache_dir}/.${container_name}.fifo"
+	done
+	# cleanup fifo
+	rm -f "${app_cache_dir}/.${container_name}.fifo"
+	printf >&2 "\nContainer Setup Complete!\n"
+fi
