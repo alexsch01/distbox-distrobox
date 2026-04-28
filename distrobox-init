@@ -1854,26 +1854,6 @@ fi
 # Set SHELL to the install path inside the container
 SHELL="$(command -v "${shell_pkg}")"
 
-# Attempt to download host-spawn during init, we don't care if it fails, so let's
-# continue in that case
-/usr/bin/distrobox-host-exec -Y test 2> /dev/null > /dev/null || :
-
-# If xdg-open is not present and we don't have an init system, do a link of it.
-# This is handy to handle opening of links, files and apps from inside the container
-# into the host.
-if [ "${init}" -eq 0 ] && ! command -v xdg-open; then
-	mkdir -p /usr/local/bin/
-	ln -sf /usr/bin/distrobox-host-exec /usr/local/bin/xdg-open
-fi
-
-# If flatpak is not present, do a link of it. This is handy to handle opening of
-# links, files and apps from inside the container into the host.
-# Note: we're using /usr/bin instead of /usr/local/bin because xdg-open will read
-# the desktopfile, which will contain an absolute path of /usr/bin/flatpak
-if ! command -v flatpak; then
-	ln -sf /usr/bin/distrobox-host-exec /usr/bin/flatpak
-fi
-
 ###############################################################################
 
 # Ensure compatibility with older versions of su, this will allow to specify
@@ -2228,26 +2208,6 @@ export SHELL="\$(getent passwd "\${USER}" | cut -f 7 -d :)"
 test -z "\${XDG_RUNTIME_DIR:-}" && export XDG_RUNTIME_DIR="/run/user/\$(id -ru)"
 test -z "\${DBUS_SESSION_BUS_ADDRESS:-}" && export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -ru)/bus"
 
-# Ensure we have these two variables from the host, so that graphical apps
-# also work in case we use a login session
-if [ -z "\$XAUTHORITY" ]; then
-    export XAUTHORITY="\$(host-spawn sh -c "printf "%s" \\\$XAUTHORITY")"
-    # if the variable is still empty, unset it, because empty it could be harmful
-    [ -z "\$XAUTHORITY" ] && unset XAUTHORITY
-fi
-if [ -z "\$XAUTHLOCALHOSTNAME" ]; then
-    export XAUTHLOCALHOSTNAME="\$(host-spawn sh -c "printf "%s" \\\$XAUTHLOCALHOSTNAME")"
-    [ -z "\$XAUTHLOCALHOSTNAME" ] && unset XAUTHLOCALHOSTNAME
-fi
-if [ -z "\$WAYLAND_DISPLAY" ]; then
-    export WAYLAND_DISPLAY="\$(host-spawn sh -c "printf "%s" \\\$WAYLAND_DISPLAY")"
-    [ -z "\$WAYLAND_DISPLAY" ] && unset WAYLAND_DISPLAY
-fi
-if [ -z "\$DISPLAY" ]; then
-    export DISPLAY="\$(host-spawn sh -c "printf "%s" \\\$DISPLAY")"
-    [ -z "\$DISPLAY" ] && unset DISPLAY
-fi
-
 # This will ensure a default prompt for a container, this will be remineshent of
 # toolbx prompt: https://github.com/containers/toolbox/blob/main/profile.d/toolbox.sh#L47
 # this will ensure greater compatibility between the two implementations
@@ -2278,26 +2238,6 @@ if status --is-interactive
 
 	test -z "\$XDG_RUNTIME_DIR && set -gx XDG_RUNTIME_DIR /run/user/(id -ru)
 	test -z "\$DBUS_SESSION_BUS_ADDRESS && set -gx DBUS_SESSION_BUS_ADDRESS unix:path=/run/user/(id -ru)/bus
-
-	# Ensure we have these two variables from the host, so that graphical apps
-	# also work in case we use a login session
-	if test -z \$XAUTHORITY
-		set -gx XAUTHORITY (host-spawn sh -c "printf "%s" \\\$XAUTHORITY")
-		# if the variable is still empty, unset it, because empty it could be harmful
-		test -z \$XAUTHORITY ; and set -e XAUTHORITY
-	end
-	if test -z \$XAUTHLOCALHOSTNAME
-		set -gx XAUTHLOCALHOSTNAME (host-spawn sh -c "printf "%s" \\\$XAUTHLOCALHOSTNAME")
-		test -z \$XAUTHLOCALHOSTNAME ; and set -e XAUTHLOCALHOSTNAME
-	end
-	if test -z \$WAYLAND_DISPLAY
-		set -gx WAYLAND_DISPLAY (host-spawn sh -c "printf "%s" \\\$WAYLAND_DISPLAY")
-		test -z \$WAYLAND_DISPLAY ; and set -e WAYLAND_DISPLAY
-	end
-	if test -z \$DISPLAY
-		set -gx DISPLAY (host-spawn sh -c "printf "%s" \\\$DISPLAY")
-		test -z \$DISPLAY ; and set -e DISPLAY
-	end
 
 	# This will ensure we have a first-shell password setup for an user if needed.
 	# We're going to use this later in case of rootful containers
