@@ -74,7 +74,7 @@ pre_init_hook=""
 rootful=0
 upgrade=0
 verbose=0
-version="1.8.2.4"
+version="1.8.2.5"
 
 # show_help will print usage to stdout.
 # Arguments:
@@ -233,7 +233,13 @@ fi
 #
 # if /run/.nopasswd is present, let's treat the init as rootless, this is not
 # a good thing, users behold!
-if stat /run/host/etc/shadow > /dev/null &&
+#
+# if /run/.distrobox.rootless is present, the container was explicitly created
+# without --root (distrobox-create mounts this marker for rootless containers).
+# Trust it over the shadow heuristic, which gives false positives on Docker
+# Desktop (macOS) where the container always has root access to the VM's fs.
+if [ ! -e /run/.distrobox.rootless ] &&
+	stat /run/host/etc/shadow > /dev/null &&
 	{
 		[ "$(stat -c "%u" /run/host/etc/shadow)" = "0" ] || [ "$(stat -f "%u" /run/host/etc/shadow 2> /dev/null)" = "0" ]
 	} &&
@@ -969,9 +975,21 @@ setup_aptrpm()
 		control sudo public
 		control sudoreplay public
 		control su wheel
-		mkdir /etc/tcb/"${container_user_name}"
+		control pam_mktemp disabled
+		mkdir -p /etc/tcb/"${container_user_name}"
 		echo "${container_user_name}::::::::" > /etc/tcb/"${container_user_name}"/shadow
 		sed -i 's/*//g' /etc/passwd
+
+		# ALT Linux ships its own su incompatible with util-linux su flags.
+		# distrobox-enter passes flags like -m, --pty, -s, -c which ALT su rejects.
+		# runuser (from util-linux, always present) accepts the same flags.
+		# Place the wrapper in /usr/local/bin so it is found before /bin/su.
+		mkdir -p /usr/local/bin
+		cat << 'EOF' > /usr/local/bin/su
+#!/bin/sh
+exec /usr/sbin/runuser "$@"
+EOF
+		chmod +x /usr/local/bin/su
 	fi
 
 	# In case the locale is not available, install it
@@ -1624,8 +1642,17 @@ setup_zypper()
 	# poor out-of-the-box experience (e.g., when trying to run GUI apps).
 	# So, let's enable them. For the same reason, we make sure we install
 	# docs.
-	sed -i 's/.*solver.onlyRequires.*/solver.onlyRequires = false/g' /etc/zypp/zypp.conf
-	sed -i 's/.*rpm.install.excludedocs.*/rpm.install.excludedocs = no/g' /etc/zypp/zypp.conf
+	if [ -d /etc/zypp/zypp.conf.d ]; then
+		cat << EOF > /etc/zypp/zypp.conf.d/99-distrobox.conf
+[main]
+solver.onlyRequires = false
+rpm.install.excludedocs = no
+EOF
+	else
+		sed -i 's/.*solver.onlyRequires.*/solver.onlyRequires = false/g' /etc/zypp/zypp.conf
+		sed -i 's/.*rpm.install.excludedocs.*/rpm.install.excludedocs = no/g' /etc/zypp/zypp.conf
+	fi
+
 	# With recommended packages, something might try to pull in
 	# parallel-printer-support which can't be installed in rootless containers.
 	# Since we very much likely never need it, just lock it
@@ -1835,8 +1862,10 @@ SHELL="$(command -v "${shell_pkg}")"
 # This won't work well on very old distros with su version from util-linux
 # before version 2.34 or other su implementations but will give an usable
 # shell nonetheless
-if ! su --version | grep -q util-linux ||
-	su --version | awk '{printf  "%s\n%s", $4, 2.34}' | sort --check=quiet --version-sort; then
+if [ ! -e /usr/local/bin/su ] && {
+	! su --version | grep -q util-linux ||
+		su --version | awk '{printf  "%s\n%s", $4, 2.34}' | sort --check=quiet --version-sort
+}; then
 	cat << EOF > /usr/local/bin/su
 #!/bin/sh
 
@@ -1917,6 +1946,7 @@ printf "distrobox: Setting up host's sockets integration...\n"
 # for example using `podman --remote` to control the host's podman from inside
 # the container or accessing docker and libvirt sockets.
 host_sockets="$(find /run/host/run \
+	-xdev \
 	-path /run/host/run/media -prune -o \
 	-path /run/host/run/timeshift -prune -o \
 	-name 'user' -prune -o \
@@ -1934,7 +1964,7 @@ host_sockets="$(find /run/host/run \
 # create many problems with package managers thinking they have access to
 # system dbus, user auth cache misused or query wrong user information.
 for host_socket in ${host_sockets}; do
-	container_socket="$(printf "%s" "${host_socket}" | sed 's|/run/host||g')"
+	container_socket="${host_socket#/run/host}"
 	# Check if the socket already exists or the symlink already exists
 	if [ ! -S "${container_socket}" ] && [ ! -L "${container_socket}" ]; then
 		# link it.
@@ -1954,7 +1984,9 @@ if [ "${nvidia}" -eq 1 ]; then
 	# Refresh ldconfig cache, also detect if there are empty files remaining
 	# and clean them.
 	# This could happen when upgrading drivers and changing versions.
-	find /usr/lib* -empty -iname "*.so.*" -exec sh -c 'rm -rf "$1" || umount "$1" && rm -rf "$1"' sh {} ';' || :
+	# Use "*.so*" instead of "*.so.*" to also match unversioned .so stubs
+	# (e.g. libcuda.so, libnvcuvid.so) that block CUDA detection. See #1764.
+	find /usr/lib* -empty -iname "*.so*" -exec sh -c 'rm -rf "$1" || umount "$1" && rm -rf "$1"' sh {} ';' || :
 	find /usr/ /etc/ -empty -iname "*nvidia*" -exec sh -c 'rm -rf "$1" || umount "$1" && rm -rf "$1"' sh {} ';' || :
 
 	# First we find all generic config files we might need
@@ -2531,6 +2563,13 @@ fi
 
 # Now we're done
 touch /etc/passwd.done
+
+# Ensure shadow files are readable by root without relying on CAP_DAC_OVERRIDE,
+# which may not be effective on all container storage drivers (e.g. fuse-overlayfs
+# in rootless mode, or VMs like Docker Desktop / Colima on macOS).
+# Fedora/Arch ship these as mode 000, expecting the capability to bypass DAC.
+chmod 0400 /etc/shadow 2> /dev/null || :
+chmod 0400 /etc/gshadow 2> /dev/null || :
 ###############################################################################
 
 ###############################################################################
